@@ -1,20 +1,26 @@
 """
-transformer_lib.py
-==================
-Importable library: a decoder-only Transformer (from the paper "Attention Is All
-You Need") with switchable positional encodings, trained on Tiny Shakespeare.
+transformer_encdec.py
+=====================
+Full ENCODER-DECODER Transformer (Figure 1 of "Attention Is All You Need")
+trained on sequence-to-sequence tasks built from Tiny Shakespeare.
 
-    sinusoidal : static sin/cos, added to embeddings
-    learned    : trainable nn.Embedding, added to embeddings
-    rope       : rotary embedding, applied to Q and K inside attention
-    none       : no positional information (ablation baseline)
+Tasks (source -> target, both fixed-length character sequences):
+    reverse      : target = source reversed (decoder MUST use cross-attention; position matters a lot)
+    continuation : source = 64 chars, target = the next 64 chars of the text
 
-Use as a library (see benchmarks.ipynb):
-    from transformer_lib import Config, load_data, train, evaluate_at_length
+Positional encodings (applied to the source AND target sides):
+    sinusoidal : static sin/cos added to embeddings
+    learned    : trainable table (separate for source and target)
+    rope       : rotary, applied to Q/K in self-attention (NOT in cross-attention, since
+                 queries and keys come from two different sequences)
+    none       : no position info (baseline)
 
-Or from the command line:
-    python transformer_lib.py --pos rope
-    python transformer_lib.py --pos all --max_iters 300 --device cpu   # quick test
+Library use:
+    from transformer_encdec import Config, load_data, train, evaluate_at_length
+
+Command line:
+    python transformer_encdec.py --task reverse --pos all
+    python transformer_encdec.py --task reverse --pos rope --max_iters 300 --device cpu   # quick test
 """
 
 import argparse
@@ -31,6 +37,7 @@ import torch.nn.functional as F
 
 DATA_URL = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
 POS_TYPES = ["sinusoidal", "learned", "rope", "none"]
+TASKS = ["reverse", "continuation"]
 
 
 # ----------------------------------------------------------------------------
@@ -38,19 +45,22 @@ POS_TYPES = ["sinusoidal", "learned", "rope", "none"]
 # ----------------------------------------------------------------------------
 @dataclass
 class Config:
+    task: str = "reverse"
     d_model: int = 256
     n_heads: int = 4
-    n_layers: int = 4
+    n_enc_layers: int = 3        # paper uses 6; 3 trains faster
+    n_dec_layers: int = 3
     d_ff: int = 1024
-    block_size: int = 128        # training context length
-    max_len_factor: int = 4      # fixed/rope buffers cover block_size * factor (for extrapolation tests)
+    src_len: int = 64
+    tgt_len: int = 64
+    max_len_factor: int = 4      # fixed/rope buffers cover length * factor (extrapolation tests)
     batch_size: int = 64
     dropout: float = 0.1
     lr: float = 1e-3
     warmup: int = 200
     max_iters: int = 3000
     eval_interval: int = 250
-    eval_iters: int = 50
+    eval_iters: int = 30
     seed: int = 1337
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -72,18 +82,27 @@ def load_data(path="input.txt"):
     return data[:n], data[n:], chars, stoi, itos
 
 
-def get_batch(data, block_size, batch_size, device):
-    ix = torch.randint(len(data) - block_size - 1, (batch_size,))
-    x = torch.stack([data[i : i + block_size] for i in ix])
-    y = torch.stack([data[i + 1 : i + block_size + 1] for i in ix])
-    return x.to(device), y.to(device)
+def get_batch(data, task, src_len, tgt_len, batch_size, device, bos_id):
+    """Returns (src, dec_in, tgt).  dec_in = [BOS] + tgt[:-1]  ("outputs shifted right")."""
+    ix = torch.randint(len(data) - src_len - tgt_len - 1, (batch_size,))
+    src = torch.stack([data[i : i + src_len] for i in ix])
+    if task == "reverse":
+        assert src_len == tgt_len, "reverse task needs src_len == tgt_len"
+        tgt = src.flip(1)
+    elif task == "continuation":
+        tgt = torch.stack([data[i + src_len : i + src_len + tgt_len] for i in ix])
+    else:
+        raise ValueError(f"task must be one of {TASKS}")
+    bos = torch.full((batch_size, 1), bos_id, dtype=torch.long)
+    dec_in = torch.cat([bos, tgt[:, :-1]], dim=1)
+    return src.to(device), dec_in.to(device), tgt.to(device)
 
 
 # ----------------------------------------------------------------------------
 # Positional encodings
 # ----------------------------------------------------------------------------
 class SinusoidalPE(nn.Module):
-    """Static: PE(pos,2i)=sin(pos/10000^(2i/d)), PE(pos,2i+1)=cos(...). No parameters."""
+    """Static sin/cos, added to embeddings. No parameters."""
 
     def __init__(self, d_model, max_len):
         super().__init__()
@@ -94,12 +113,12 @@ class SinusoidalPE(nn.Module):
         pe[:, 1::2] = torch.cos(pos * div)
         self.register_buffer("pe", pe)
 
-    def forward(self, x):  # (B, T, d_model)
+    def forward(self, x):
         return x + self.pe[: x.size(1)]
 
 
 class LearnedPE(nn.Module):
-    """Learned: one trainable vector per position. Cannot go beyond `max_len`."""
+    """One trainable vector per position. Cannot go beyond `max_len`."""
 
     def __init__(self, d_model, max_len):
         super().__init__()
@@ -114,7 +133,7 @@ class LearnedPE(nn.Module):
 
 
 class RotaryPE(nn.Module):
-    """RoPE: rotate Q and K by a position-dependent angle -> scores depend on relative distance."""
+    """RoPE: rotate Q and K by a position-dependent angle (relative position in the dot product)."""
 
     def __init__(self, head_dim, max_len):
         super().__init__()
@@ -130,42 +149,49 @@ class RotaryPE(nn.Module):
         x1, x2 = x.chunk(2, dim=-1)
         return torch.cat([-x2, x1], dim=-1)
 
-    def forward(self, q, k):  # (B, heads, T, head_dim)
+    def forward(self, q, k):
         T = q.size(2)
         cos, sin = self.cos[:T], self.sin[:T]
         return q * cos + self._rotate_half(q) * sin, k * cos + self._rotate_half(k) * sin
 
 
 # ----------------------------------------------------------------------------
-# Transformer blocks
+# Building blocks
 # ----------------------------------------------------------------------------
 class MultiHeadAttention(nn.Module):
-    """Scaled dot-product attention with h heads and a causal mask."""
+    """
+    Scaled dot-product multi-head attention. Queries come from x_q; keys and values come from x_kv.
+        self-attention  : x_kv is x_q
+        cross-attention : x_kv is the encoder output (memory)
+    causal=True adds the look-ahead mask used in the decoder's masked self-attention.
+    """
 
-    def __init__(self, d_model, n_heads, max_len, dropout, rope=None):
+    def __init__(self, d_model, n_heads, dropout, max_len, causal=False, rope=None):
         super().__init__()
         assert d_model % n_heads == 0
-        self.h, self.dk = n_heads, d_model // n_heads
+        self.h, self.dk, self.causal, self.rope = n_heads, d_model // n_heads, causal, rope
         self.W_q = nn.Linear(d_model, d_model, bias=False)
         self.W_k = nn.Linear(d_model, d_model, bias=False)
         self.W_v = nn.Linear(d_model, d_model, bias=False)
         self.W_o = nn.Linear(d_model, d_model)
         self.drop = nn.Dropout(dropout)
-        self.rope = rope
-        self.register_buffer("mask", torch.tril(torch.ones(max_len, max_len)).bool())
+        if causal:
+            self.register_buffer("mask", torch.tril(torch.ones(max_len, max_len)).bool())
 
-    def forward(self, x):
-        B, T, C = x.shape
-        q = self.W_q(x).view(B, T, self.h, self.dk).transpose(1, 2)
-        k = self.W_k(x).view(B, T, self.h, self.dk).transpose(1, 2)
-        v = self.W_v(x).view(B, T, self.h, self.dk).transpose(1, 2)
-        if self.rope is not None:
+    def forward(self, x_q, x_kv):
+        B, Tq, C = x_q.shape
+        Tk = x_kv.size(1)
+        q = self.W_q(x_q).view(B, Tq, self.h, self.dk).transpose(1, 2)
+        k = self.W_k(x_kv).view(B, Tk, self.h, self.dk).transpose(1, 2)
+        v = self.W_v(x_kv).view(B, Tk, self.h, self.dk).transpose(1, 2)
+        if self.rope is not None:                      # self-attention only
             q, k = self.rope(q, k)
-        scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.dk)       # MatMul + Scale
-        scores = scores.masked_fill(~self.mask[:T, :T], float("-inf"))  # Mask
-        weights = self.drop(F.softmax(scores, dim=-1))                 # SoftMax
-        out = (weights @ v).transpose(1, 2).contiguous().view(B, T, C)  # MatMul + Concat
-        return self.W_o(out)                                           # Linear
+        scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.dk)          # MatMul + Scale
+        if self.causal:
+            scores = scores.masked_fill(~self.mask[:Tq, :Tk], float("-inf"))  # Mask
+        weights = self.drop(F.softmax(scores, dim=-1))                   # SoftMax
+        out = (weights @ v).transpose(1, 2).contiguous().view(B, Tq, C)  # MatMul + Concat
+        return self.W_o(out)                                             # Linear
 
 
 class FeedForward(nn.Module):
@@ -177,45 +203,68 @@ class FeedForward(nn.Module):
         return self.net(x)
 
 
-class Block(nn.Module):
-    """Decoder layer, pre-LayerNorm variant: x = x + Sublayer(LN(x))."""
+class EncoderLayer(nn.Module):
+    """Self-attention (bidirectional) -> Feed Forward. Pre-LayerNorm residual blocks."""
 
-    def __init__(self, d_model, n_heads, d_ff, max_len, dropout, rope):
+    def __init__(self, cfg, max_len, rope):
         super().__init__()
-        self.ln1 = nn.LayerNorm(d_model)
-        self.attn = MultiHeadAttention(d_model, n_heads, max_len, dropout, rope)
-        self.ln2 = nn.LayerNorm(d_model)
-        self.ff = FeedForward(d_model, d_ff, dropout)
+        self.ln1 = nn.LayerNorm(cfg.d_model)
+        self.attn = MultiHeadAttention(cfg.d_model, cfg.n_heads, cfg.dropout, max_len, causal=False, rope=rope)
+        self.ln2 = nn.LayerNorm(cfg.d_model)
+        self.ff = FeedForward(cfg.d_model, cfg.d_ff, cfg.dropout)
 
     def forward(self, x):
-        x = x + self.attn(self.ln1(x))
+        h = self.ln1(x)
+        x = x + self.attn(h, h)
         return x + self.ff(self.ln2(x))
 
 
-class TransformerLM(nn.Module):
+class DecoderLayer(nn.Module):
+    """Masked self-attention -> Cross-attention (to encoder) -> Feed Forward."""
+
+    def __init__(self, cfg, max_len, rope):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(cfg.d_model)
+        self.self_attn = MultiHeadAttention(cfg.d_model, cfg.n_heads, cfg.dropout, max_len, causal=True, rope=rope)
+        self.ln2 = nn.LayerNorm(cfg.d_model)
+        self.cross_attn = MultiHeadAttention(cfg.d_model, cfg.n_heads, cfg.dropout, max_len, causal=False, rope=None)
+        self.ln3 = nn.LayerNorm(cfg.d_model)
+        self.ff = FeedForward(cfg.d_model, cfg.d_ff, cfg.dropout)
+
+    def forward(self, x, memory):
+        h = self.ln1(x)
+        x = x + self.self_attn(h, h)                      # masked: can't see future target tokens
+        x = x + self.cross_attn(self.ln2(x), memory)      # Q from decoder, K/V from encoder
+        return x + self.ff(self.ln3(x))
+
+
+class EncoderDecoderTransformer(nn.Module):
     def __init__(self, vocab_size, pos_type, cfg: Config):
+        """vocab_size = number of real characters. One extra id (= vocab_size) is the BOS token."""
         super().__init__()
         if pos_type not in POS_TYPES:
             raise ValueError(f"pos_type must be one of {POS_TYPES}")
-        self.pos_type, self.d_model, self.block_size = pos_type, cfg.d_model, cfg.block_size
-        max_len = cfg.block_size * cfg.max_len_factor
-        self.tok_emb = nn.Embedding(vocab_size, cfg.d_model)
+        self.pos_type, self.d_model, self.bos_id = pos_type, cfg.d_model, vocab_size
+        V = vocab_size + 1
+        max_len = max(cfg.src_len, cfg.tgt_len) * cfg.max_len_factor
 
-        self.pos_enc, rope = None, None
+        self.tok_emb = nn.Embedding(V, cfg.d_model)        # shared by source, target, and output head
+        self.pos_src = self.pos_tgt = None
+        rope = None
         if pos_type == "sinusoidal":
-            self.pos_enc = SinusoidalPE(cfg.d_model, max_len)
+            self.pos_src, self.pos_tgt = SinusoidalPE(cfg.d_model, max_len), SinusoidalPE(cfg.d_model, max_len)
         elif pos_type == "learned":
-            self.pos_enc = LearnedPE(cfg.d_model, cfg.block_size)  # only trained positions exist
+            self.pos_src, self.pos_tgt = LearnedPE(cfg.d_model, cfg.src_len), LearnedPE(cfg.d_model, cfg.tgt_len)
         elif pos_type == "rope":
             rope = RotaryPE(cfg.d_model // cfg.n_heads, max_len)
 
         self.drop = nn.Dropout(cfg.dropout)
-        self.blocks = nn.ModuleList(
-            [Block(cfg.d_model, cfg.n_heads, cfg.d_ff, max_len, cfg.dropout, rope) for _ in range(cfg.n_layers)]
-        )
-        self.ln_f = nn.LayerNorm(cfg.d_model)
-        self.head = nn.Linear(cfg.d_model, vocab_size, bias=False)
-        self.head.weight = self.tok_emb.weight  # weight tying
+        self.enc_layers = nn.ModuleList([EncoderLayer(cfg, max_len, rope) for _ in range(cfg.n_enc_layers)])
+        self.enc_ln = nn.LayerNorm(cfg.d_model)
+        self.dec_layers = nn.ModuleList([DecoderLayer(cfg, max_len, rope) for _ in range(cfg.n_dec_layers)])
+        self.dec_ln = nn.LayerNorm(cfg.d_model)
+        self.head = nn.Linear(cfg.d_model, V, bias=False)
+        self.head.weight = self.tok_emb.weight             # weight tying (as in the paper)
         self.apply(self._init)
 
     @staticmethod
@@ -225,106 +274,144 @@ class TransformerLM(nn.Module):
             if isinstance(m, nn.Linear) and m.bias is not None:
                 nn.init.zeros_(m.bias)
 
-    def forward(self, idx, targets=None):
-        x = self.tok_emb(idx) * math.sqrt(self.d_model)
-        if self.pos_enc is not None:
-            x = self.pos_enc(x)
+    def encode(self, src):
+        x = self.tok_emb(src) * math.sqrt(self.d_model)
+        if self.pos_src is not None:
+            x = self.pos_src(x)
         x = self.drop(x)
-        for blk in self.blocks:
-            x = blk(x)
-        logits = self.head(self.ln_f(x))
-        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1)) if targets is not None else None
+        for layer in self.enc_layers:
+            x = layer(x)
+        return self.enc_ln(x)                              # "memory"
+
+    def decode(self, dec_in, memory):
+        x = self.tok_emb(dec_in) * math.sqrt(self.d_model)
+        if self.pos_tgt is not None:
+            x = self.pos_tgt(x)
+        x = self.drop(x)
+        for layer in self.dec_layers:
+            x = layer(x, memory)
+        return self.head(self.dec_ln(x))                   # Linear (softmax lives in the loss)
+
+    def forward(self, src, dec_in, targets=None):
+        logits = self.decode(dec_in, self.encode(src))
+        loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1)) if targets is not None else None
         return logits, loss
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0):
-        for _ in range(max_new_tokens):
-            logits, _ = self(idx[:, -self.block_size :])
-            probs = F.softmax(logits[:, -1, :] / temperature, dim=-1)
-            idx = torch.cat([idx, torch.multinomial(probs, 1)], dim=1)
-        return idx
+    def greedy_decode(self, src, length):
+        """Generate `length` tokens one at a time (feeding each prediction back in)."""
+        memory = self.encode(src)
+        ys = torch.full((src.size(0), 1), self.bos_id, dtype=torch.long, device=src.device)
+        for _ in range(length):
+            nxt = self.decode(ys, memory)[:, -1].argmax(-1, keepdim=True)
+            ys = torch.cat([ys, nxt], dim=1)
+        return ys[:, 1:]
 
 
 # ----------------------------------------------------------------------------
-# Training and benchmarking
+# Evaluation
 # ----------------------------------------------------------------------------
 @torch.no_grad()
-def estimate_loss(model, train_data, val_data, cfg: Config):
+def _eval(model, data, cfg, src_len, tgt_len, iters, batch_size):
     model.eval()
+    losses, accs = [], []
+    for _ in range(iters):
+        src, dec_in, tgt = get_batch(data, cfg.task, src_len, tgt_len, batch_size, cfg.device, model.bos_id)
+        logits, loss = model(src, dec_in, tgt)
+        losses.append(loss.item())
+        accs.append((logits.argmax(-1) == tgt).float().mean().item())
+    return sum(losses) / len(losses), sum(accs) / len(accs)
+
+
+def estimate_loss(model, train_data, val_data, cfg: Config):
+    """Teacher-forced loss and token accuracy on train and val."""
     out = {}
     for name, d in (("train", train_data), ("val", val_data)):
-        losses = torch.zeros(cfg.eval_iters)
-        for i in range(cfg.eval_iters):
-            x, y = get_batch(d, cfg.block_size, cfg.batch_size, cfg.device)
-            losses[i] = model(x, y)[1].item()
-        out[name] = losses.mean().item()
+        out[name], out[name + "_acc"] = _eval(model, d, cfg, cfg.src_len, cfg.tgt_len, cfg.eval_iters, cfg.batch_size)
     model.train()
     return out
 
 
-@torch.no_grad()
-def evaluate_at_length(model, data, length, cfg: Config, iters=30, batch_size=16):
-    """Validation loss on sequences of a given length (may be longer than the training block_size).
-    Returns NaN if the model cannot handle that length (e.g. learned PE beyond block_size)."""
-    model.eval()
-    losses = []
+def evaluate_at_length(model, data, length, cfg: Config, iters=20, batch_size=16):
+    """Loss/accuracy on sequences of a different length. NaN if the model can't handle it (learned PE)."""
     try:
-        for _ in range(iters):
-            x, y = get_batch(data, length, batch_size, cfg.device)
-            losses.append(model(x, y)[1].item())
+        loss, acc = _eval(model, data, cfg, length, length, iters, batch_size)
     except ValueError:
-        return float("nan")
-    return sum(losses) / len(losses)
+        return {"loss": float("nan"), "acc": float("nan")}
+    return {"loss": loss, "acc": acc}
 
 
+@torch.no_grad()
+def greedy_accuracy(model, data, cfg: Config, n=256):
+    """Free-running decoding (no teacher forcing). Returns per-character and whole-sequence accuracy."""
+    model.eval()
+    src, _, tgt = get_batch(data, cfg.task, cfg.src_len, cfg.tgt_len, n, cfg.device, model.bos_id)
+    pred = model.greedy_decode(src, tgt.size(1))
+    match = (pred == tgt)
+    return {"char_acc": match.float().mean().item(), "exact_match": match.all(1).float().mean().item()}
+
+
+@torch.no_grad()
+def example_prediction(model, data, cfg: Config, itos):
+    """One validation example decoded to text: (source, target, prediction)."""
+    model.eval()
+    src, _, tgt = get_batch(data, cfg.task, cfg.src_len, cfg.tgt_len, 1, cfg.device, model.bos_id)
+    pred = model.greedy_decode(src, tgt.size(1))
+    s = lambda t: "".join(itos.get(i, "?") for i in t[0].tolist()).replace("\n", "\\n")
+    return s(src), s(tgt), s(pred)
+
+
+# ----------------------------------------------------------------------------
+# Training
+# ----------------------------------------------------------------------------
 def _sync(device):
     if str(device).startswith("cuda"):
         torch.cuda.synchronize()
 
 
-def train(pos_type, cfg: Config, train_data, val_data, vocab_size, itos, verbose=True, sample_tokens=300):
-    """Train one model. Returns a dict with the model, loss history, params, timing, and a text sample."""
+def train(pos_type, cfg: Config, train_data, val_data, vocab_size, itos, verbose=True):
+    """Train one model. Returns dict with model, history, params, timing, greedy metrics, example."""
     torch.manual_seed(cfg.seed)
-    model = TransformerLM(vocab_size, pos_type, cfg).to(cfg.device)
+    model = EncoderDecoderTransformer(vocab_size, pos_type, cfg).to(cfg.device)
     n_params = sum(p.numel() for p in model.parameters())
     if verbose:
-        print(f"\n=== {pos_type} | {n_params/1e6:.2f}M params | device={cfg.device} ===")
+        print(f"\n=== {cfg.task} | {pos_type} | {n_params/1e6:.2f}M params | device={cfg.device} ===")
 
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, betas=(0.9, 0.98), weight_decay=0.01)
     sched = torch.optim.lr_scheduler.LambdaLR(
         opt, lambda s: min((s + 1) / cfg.warmup, 0.5 * (1 + math.cos(math.pi * min(s, cfg.max_iters) / cfg.max_iters)))
     )
 
-    hist = {"step": [], "train": [], "val": []}
+    hist = {"step": [], "train_loss": [], "val_loss": [], "val_acc": []}
     train_time = 0.0
     for step in range(cfg.max_iters + 1):
         if step % cfg.eval_interval == 0:
-            l = estimate_loss(model, train_data, val_data, cfg)
-            hist["step"].append(step); hist["train"].append(l["train"]); hist["val"].append(l["val"])
+            m = estimate_loss(model, train_data, val_data, cfg)
+            hist["step"].append(step); hist["train_loss"].append(m["train"])
+            hist["val_loss"].append(m["val"]); hist["val_acc"].append(m["val_acc"])
             if verbose:
-                print(f"step {step:5d} | train {l['train']:.4f} | val {l['val']:.4f}")
+                print(f"step {step:5d} | train {m['train']:.4f} | val {m['val']:.4f} | val tok-acc {m['val_acc']:.3f}")
         if step == cfg.max_iters:
             break
-        x, y = get_batch(train_data, cfg.block_size, cfg.batch_size, cfg.device)
+        src, dec_in, tgt = get_batch(train_data, cfg.task, cfg.src_len, cfg.tgt_len, cfg.batch_size, cfg.device, model.bos_id)
         _sync(cfg.device); t0 = time.perf_counter()
-        _, loss = model(x, y)
+        _, loss = model(src, dec_in, tgt)
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step(); sched.step()
         _sync(cfg.device); train_time += time.perf_counter() - t0
 
-    model.eval()
-    ctx = torch.zeros((1, 1), dtype=torch.long, device=cfg.device)
-    sample = "".join(itos[i] for i in model.generate(ctx, sample_tokens)[0].tolist())
+    greedy = greedy_accuracy(model, val_data, cfg)
+    ex = example_prediction(model, val_data, cfg, itos)
     return {
         "pos_type": pos_type, "model": model, "params": n_params, "history": hist,
-        "train_time_s": train_time, "sec_per_step": train_time / cfg.max_iters, "sample": sample,
+        "train_time_s": train_time, "sec_per_step": train_time / cfg.max_iters,
+        "greedy": greedy, "example": ex,
     }
 
 
-def save_results(results, path="results.json"):
-    """Save everything except the model objects."""
+def save_results(results, path="results_encdec.json"):
     slim = {k: {kk: vv for kk, vv in v.items() if kk != "model"} for k, v in results.items()}
     json.dump(slim, open(path, "w"), indent=2)
 
@@ -342,14 +429,15 @@ def main():
     cfg = Config(**args)
 
     train_data, val_data, chars, stoi, itos = load_data()
-    print(f"vocab={len(chars)} | train={len(train_data):,} | val={len(val_data):,}")
+    print(f"task={cfg.task} | vocab={len(chars)} | train={len(train_data):,} | val={len(val_data):,}")
     results = {}
     for t in (POS_TYPES if pos == "all" else [pos]):
         results[t] = train(t, cfg, train_data, val_data, len(chars), itos)
-        print(f"--- sample ({t}) ---\n{results[t]['sample']}\n")
-    print("Final validation loss:")
+        s, g, pr = results[t]["example"]
+        print(f"source : {s}\ntarget : {g}\npredict: {pr}")
+    print("\nSummary (final val loss | greedy char acc | exact match):")
     for t, r in results.items():
-        print(f"  {t:11s} {r['history']['val'][-1]:.4f}")
+        print(f"  {t:11s} {r['history']['val_loss'][-1]:.4f} | {r['greedy']['char_acc']:.3f} | {r['greedy']['exact_match']:.3f}")
     save_results(results)
 
 
