@@ -1,27 +1,32 @@
 """
-transformer_encdec.py
-=====================
-Full ENCODER-DECODER Transformer (Figure 1 of "Attention Is All You Need")
-trained on sequence-to-sequence tasks built from Tiny Shakespeare.
+transformer_encdec.py  (v2)
+===========================
+Full ENCODER-DECODER Transformer (Figure 1 of "Attention Is All You Need") trained on
+sequence-to-sequence tasks built from Tiny Shakespeare, with switchable positional encodings.
 
-Tasks (source -> target, both fixed-length character sequences):
-    reverse      : target = source reversed (decoder MUST use cross-attention; position matters a lot)
+Tasks (source -> target, fixed-length character sequences):
+    reverse      : target = source reversed (needs cross-attention AND precise position info)
     continuation : source = 64 chars, target = the next 64 chars of the text
 
-Positional encodings (applied to the source AND target sides):
+Positional encodings (applied on the source AND target sides):
     sinusoidal : static sin/cos added to embeddings
-    learned    : trainable table (separate for source and target); rows beyond the
-                 training length exist but are untrained
-    rope       : rotary, applied to Q/K in self-attention (NOT in cross-attention, since
-                 queries and keys come from two different sequences)
+    learned    : trainable table (separate for source and target); rows beyond the training
+                 length exist but are untrained
+    rope       : rotary, applied to Q/K in self-attention (not in cross-attention)
     none       : no position info (baseline)
 
+What is new in v2
+    * generate_eval(): decodes the SAME fixed validation examples for every model (fair comparison)
+    * generate(): greedy or temperature sampling; BOS can never be emitted
+    * continue_text(): chunked long-text generation for the continuation task
+    * per_position_accuracy(), decode_text(), sequence_metrics() helpers
+
 Library use:
-    from transformer_encdec import Config, load_data, train, evaluate_at_length
+    from transformer_encdec import Config, load_data, train, generate_eval, decode_text
 
 Command line:
     python transformer_encdec.py --task reverse --pos all
-    python transformer_encdec.py --task reverse --pos rope --max_iters 300 --device cpu   # quick test
+    python transformer_encdec.py --task continuation --pos rope --max_iters 300 --device cpu
 """
 
 import argparse
@@ -54,7 +59,7 @@ class Config:
     d_ff: int = 1024
     src_len: int = 64
     tgt_len: int = 64
-    max_len_factor: int = 4      # fixed/rope buffers cover length * factor (extrapolation tests)
+    max_len_factor: int = 4      # fixed/rope/learned tables cover length * factor
     batch_size: int = 64
     dropout: float = 0.1
     lr: float = 1e-3
@@ -83,9 +88,18 @@ def load_data(path="input.txt"):
     return data[:n], data[n:], chars, stoi, itos
 
 
-def get_batch(data, task, src_len, tgt_len, batch_size, device, bos_id):
-    """Returns (src, dec_in, tgt).  dec_in = [BOS] + tgt[:-1]  ("outputs shifted right")."""
-    ix = torch.randint(len(data) - src_len - tgt_len - 1, (batch_size,))
+def fixed_indices(data, cfg, n, seed=0):
+    """Deterministic start positions, so every model is evaluated on exactly the same examples."""
+    g = torch.Generator().manual_seed(seed)
+    return torch.randint(len(data) - cfg.src_len - cfg.tgt_len - 1, (n,), generator=g)
+
+
+def get_batch(data, task, src_len, tgt_len, batch_size, device, bos_id, ix=None):
+    """Returns (src, dec_in, tgt).  dec_in = [BOS] + tgt[:-1]  ("outputs shifted right").
+    If `ix` (start positions) is given, those exact examples are used instead of random ones."""
+    if ix is None:
+        ix = torch.randint(len(data) - src_len - tgt_len - 1, (batch_size,))
+    batch_size = len(ix)
     src = torch.stack([data[i : i + src_len] for i in ix])
     if task == "reverse":
         assert src_len == tgt_len, "reverse task needs src_len == tgt_len"
@@ -97,6 +111,12 @@ def get_batch(data, task, src_len, tgt_len, batch_size, device, bos_id):
     bos = torch.full((batch_size, 1), bos_id, dtype=torch.long)
     dec_in = torch.cat([bos, tgt[:, :-1]], dim=1)
     return src.to(device), dec_in.to(device), tgt.to(device)
+
+
+def decode_text(t, itos, keep_newlines=False):
+    """1-D tensor of ids -> string. Newlines become a pilcrow so one character = one column."""
+    s = "".join(itos.get(int(i), "?") for i in t)
+    return s if keep_newlines else s.replace("\n", "\u00b6")
 
 
 # ----------------------------------------------------------------------------
@@ -123,8 +143,7 @@ class LearnedPE(nn.Module):
     One trainable vector per position.
     trained_len : positions that actually receive gradients during training
     alloc_len   : rows allocated in the table (>= trained_len). Rows beyond trained_len are NEVER
-                  trained, so they keep their random initial values (what you see beyond the
-                  training length is untrained noise, not learned position information).
+                  trained, so they keep their random initial values (untrained noise).
     strict=True : raise an error beyond trained_len instead of returning those untrained rows.
     """
 
@@ -170,7 +189,7 @@ class RotaryPE(nn.Module):
 # ----------------------------------------------------------------------------
 class MultiHeadAttention(nn.Module):
     """
-    Scaled dot-product multi-head attention. Queries come from x_q; keys and values come from x_kv.
+    Scaled dot-product multi-head attention. Queries come from x_q; keys and values from x_kv.
         self-attention  : x_kv is x_q
         cross-attention : x_kv is the encoder output (memory)
     causal=True adds the look-ahead mask used in the decoder's masked self-attention.
@@ -196,12 +215,12 @@ class MultiHeadAttention(nn.Module):
         v = self.W_v(x_kv).view(B, Tk, self.h, self.dk).transpose(1, 2)
         if self.rope is not None:                      # self-attention only
             q, k = self.rope(q, k)
-        scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.dk)          # MatMul + Scale
+        scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.dk)               # MatMul + Scale
         if self.causal:
             scores = scores.masked_fill(~self.mask[:Tq, :Tk], float("-inf"))  # Mask
-        weights = self.drop(F.softmax(scores, dim=-1))                   # SoftMax
-        out = (weights @ v).transpose(1, 2).contiguous().view(B, Tq, C)  # MatMul + Concat
-        return self.W_o(out)                                             # Linear
+        weights = self.drop(F.softmax(scores, dim=-1))                        # SoftMax
+        out = (weights @ v).transpose(1, 2).contiguous().view(B, Tq, C)       # MatMul + Concat
+        return self.W_o(out)                                                  # Linear
 
 
 class FeedForward(nn.Module):
@@ -264,7 +283,8 @@ class EncoderDecoderTransformer(nn.Module):
         if pos_type == "sinusoidal":
             self.pos_src, self.pos_tgt = SinusoidalPE(cfg.d_model, max_len), SinusoidalPE(cfg.d_model, max_len)
         elif pos_type == "learned":
-            self.pos_src, self.pos_tgt = LearnedPE(cfg.d_model, cfg.src_len, alloc_len=max_len), LearnedPE(cfg.d_model, cfg.tgt_len, alloc_len=max_len)
+            self.pos_src = LearnedPE(cfg.d_model, cfg.src_len, alloc_len=max_len)
+            self.pos_tgt = LearnedPE(cfg.d_model, cfg.tgt_len, alloc_len=max_len)
         elif pos_type == "rope":
             rope = RotaryPE(cfg.d_model // cfg.n_heads, max_len)
 
@@ -308,18 +328,27 @@ class EncoderDecoderTransformer(nn.Module):
         return logits, loss
 
     @torch.no_grad()
-    def greedy_decode(self, src, length):
-        """Generate `length` tokens one at a time (feeding each prediction back in)."""
+    def generate(self, src, length, temperature=0.0):
+        """Generate `length` tokens one at a time, feeding each prediction back in.
+        temperature=0 -> greedy (argmax); temperature>0 -> sample. BOS is never emitted."""
         memory = self.encode(src)
         ys = torch.full((src.size(0), 1), self.bos_id, dtype=torch.long, device=src.device)
         for _ in range(length):
-            nxt = self.decode(ys, memory)[:, -1].argmax(-1, keepdim=True)
+            logits = self.decode(ys, memory)[:, -1]
+            logits[:, self.bos_id] = float("-inf")
+            if temperature > 0:
+                nxt = torch.multinomial(F.softmax(logits / temperature, dim=-1), 1)
+            else:
+                nxt = logits.argmax(-1, keepdim=True)
             ys = torch.cat([ys, nxt], dim=1)
         return ys[:, 1:]
 
+    def greedy_decode(self, src, length):
+        return self.generate(src, length, 0.0)
+
 
 # ----------------------------------------------------------------------------
-# Evaluation
+# Evaluation and generation
 # ----------------------------------------------------------------------------
 @torch.no_grad()
 def _eval(model, data, cfg, src_len, tgt_len, iters, batch_size):
@@ -343,32 +372,57 @@ def estimate_loss(model, train_data, val_data, cfg: Config):
 
 
 def evaluate_at_length(model, data, length, cfg: Config, iters=20, batch_size=16):
-    """Loss/accuracy on sequences of a different length. NaN if the model can't handle it (learned PE)."""
+    """Loss/accuracy on sequences of a different length. NaN if the model cannot handle that length."""
+    max_len = max(cfg.src_len, cfg.tgt_len) * cfg.max_len_factor
+    if length > max_len:
+        return {"loss": float("nan"), "acc": float("nan")}
     try:
         loss, acc = _eval(model, data, cfg, length, length, iters, batch_size)
-    except ValueError:
+    except ValueError:                                   # e.g. learned PE with strict=True
         return {"loss": float("nan"), "acc": float("nan")}
     return {"loss": loss, "acc": acc}
 
 
 @torch.no_grad()
-def greedy_accuracy(model, data, cfg: Config, n=256):
-    """Free-running decoding (no teacher forcing). Returns per-character and whole-sequence accuracy."""
+def generate_eval(model, data, cfg: Config, n=512, seed=0, temperature=0.0):
+    """Decode a FIXED set of validation examples (identical for every model when n and seed match).
+    Returns (src, tgt, pred) as CPU tensors of token ids."""
     model.eval()
-    src, _, tgt = get_batch(data, cfg.task, cfg.src_len, cfg.tgt_len, n, cfg.device, model.bos_id)
-    pred = model.greedy_decode(src, tgt.size(1))
-    match = (pred == tgt)
-    return {"char_acc": match.float().mean().item(), "exact_match": match.all(1).float().mean().item()}
+    ix = fixed_indices(data, cfg, n, seed)
+    src, _, tgt = get_batch(data, cfg.task, cfg.src_len, cfg.tgt_len, n, cfg.device, model.bos_id, ix=ix)
+    pred = model.generate(src, tgt.size(1), temperature)
+    return src.cpu(), tgt.cpu(), pred.cpu()
+
+
+def sequence_metrics(pred, tgt):
+    """Per-character accuracy and whole-sequence exact match."""
+    m = pred == tgt
+    return {"char_acc": m.float().mean().item(), "exact_match": m.all(1).float().mean().item()}
+
+
+def per_position_accuracy(pred, tgt):
+    """Accuracy at each target position (mean over examples)."""
+    return (pred == tgt).float().mean(0)
+
+
+def greedy_accuracy(model, data, cfg: Config, n=512, seed=0):
+    """Free-running greedy decoding on a fixed set of validation examples."""
+    _, tgt, pred = generate_eval(model, data, cfg, n=n, seed=seed, temperature=0.0)
+    return sequence_metrics(pred, tgt)
 
 
 @torch.no_grad()
-def example_prediction(model, data, cfg: Config, itos):
-    """One validation example decoded to text: (source, target, prediction)."""
+def continue_text(model, prompt, cfg: Config, n_chunks=4, temperature=0.8):
+    """Chunked long-text generation (continuation task): each predicted chunk is appended to the
+    context, and the last `src_len` characters become the next source."""
     model.eval()
-    src, _, tgt = get_batch(data, cfg.task, cfg.src_len, cfg.tgt_len, 1, cfg.device, model.bos_id)
-    pred = model.greedy_decode(src, tgt.size(1))
-    s = lambda t: "".join(itos.get(i, "?") for i in t[0].tolist()).replace("\n", "\\n")
-    return s(src), s(tgt), s(pred)
+    src = prompt.view(1, -1).to(cfg.device)
+    chunks = []
+    for _ in range(n_chunks):
+        pred = model.generate(src, cfg.tgt_len, temperature)
+        chunks.append(pred[0].cpu())
+        src = torch.cat([src, pred], dim=1)[:, -cfg.src_len :]
+    return torch.cat(chunks)
 
 
 # ----------------------------------------------------------------------------
@@ -379,13 +433,13 @@ def _sync(device):
         torch.cuda.synchronize()
 
 
-def train(pos_type, cfg: Config, train_data, val_data, vocab_size, itos, verbose=True):
-    """Train one model. Returns dict with model, history, params, timing, greedy metrics, example."""
+def train(pos_type, cfg: Config, train_data, val_data, vocab_size, itos=None, verbose=True):
+    """Train one model. Returns dict with model, history, params, timing, greedy metrics."""
     torch.manual_seed(cfg.seed)
     model = EncoderDecoderTransformer(vocab_size, pos_type, cfg).to(cfg.device)
     n_params = sum(p.numel() for p in model.parameters())
     if verbose:
-        print(f"\n=== {cfg.task} | {pos_type} | {n_params/1e6:.2f}M params | device={cfg.device} ===")
+        print(f"\n=== {cfg.task} | {pos_type} | {n_params/1e6:.2f}M params | {cfg.max_iters} steps | device={cfg.device} ===")
 
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, betas=(0.9, 0.98), weight_decay=0.01)
     sched = torch.optim.lr_scheduler.LambdaLR(
@@ -395,7 +449,7 @@ def train(pos_type, cfg: Config, train_data, val_data, vocab_size, itos, verbose
     hist = {"step": [], "train_loss": [], "val_loss": [], "val_acc": []}
     train_time = 0.0
     for step in range(cfg.max_iters + 1):
-        if step % cfg.eval_interval == 0:
+        if step % cfg.eval_interval == 0 or step == cfg.max_iters:
             m = estimate_loss(model, train_data, val_data, cfg)
             hist["step"].append(step); hist["train_loss"].append(m["train"])
             hist["val_loss"].append(m["val"]); hist["val_acc"].append(m["val_acc"])
@@ -413,15 +467,16 @@ def train(pos_type, cfg: Config, train_data, val_data, vocab_size, itos, verbose
         _sync(cfg.device); train_time += time.perf_counter() - t0
 
     greedy = greedy_accuracy(model, val_data, cfg)
-    ex = example_prediction(model, val_data, cfg, itos)
+    if verbose:
+        print(f"greedy decoding: char acc {greedy['char_acc']:.3f} | exact match {greedy['exact_match']:.3f}")
     return {
         "pos_type": pos_type, "model": model, "params": n_params, "history": hist,
-        "train_time_s": train_time, "sec_per_step": train_time / cfg.max_iters,
-        "greedy": greedy, "example": ex,
+        "train_time_s": train_time, "sec_per_step": train_time / cfg.max_iters, "greedy": greedy,
     }
 
 
-def save_results(results, path="results_encdec.json"):
+def save_results(results, path="results.json"):
+    """Save everything except the model objects."""
     slim = {k: {kk: vv for kk, vv in v.items() if kk != "model"} for k, v in results.items()}
     json.dump(slim, open(path, "w"), indent=2)
 
@@ -443,12 +498,13 @@ def main():
     results = {}
     for t in (POS_TYPES if pos == "all" else [pos]):
         results[t] = train(t, cfg, train_data, val_data, len(chars), itos)
-        s, g, pr = results[t]["example"]
-        print(f"source : {s}\ntarget : {g}\npredict: {pr}")
+        src, tgt, pred = generate_eval(results[t]["model"], val_data, cfg, n=1)
+        print(f"source : {decode_text(src[0], itos)}\ntarget : {decode_text(tgt[0], itos)}\n"
+              f"predict: {decode_text(pred[0], itos)}")
     print("\nSummary (final val loss | greedy char acc | exact match):")
     for t, r in results.items():
         print(f"  {t:11s} {r['history']['val_loss'][-1]:.4f} | {r['greedy']['char_acc']:.3f} | {r['greedy']['exact_match']:.3f}")
-    save_results(results)
+    save_results(results, f"results_{cfg.task}.json")
 
 
 if __name__ == "__main__":
